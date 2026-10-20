@@ -148,7 +148,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Financial Fraud Risk Intelligence Assistant",
+    title="Financial Fraud Risk Intelligence Assistant (class demo)",
     description=(
         "Score a transaction, explain it, and ask the knowledge assistant — the week 1–9 "
         "project behind one HTTP interface."
