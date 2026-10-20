@@ -1,0 +1,21 @@
+question,expected_tool
+What does row 14532 look like?,lookup_transaction
+Was transaction 2192 confirmed as fraud?,lookup_transaction
+Show me case 4022,lookup_transaction
+What is PR-AUC and why use it?,search_knowledge
+Why is is_flagged_fraud excluded from the model features?,search_knowledge
+What is PSI and when does it matter?,search_knowledge
+Where does the project data come from?,search_knowledge
+Who reviews a high-risk transaction?,search_knowledge
+Show me cases similar to transaction 14532,find_similar_cases
+Which confirmed frauds resemble row 2192?,find_similar_cases
+What is the fraud rate by transaction type?,aggregate_stats
+How many confirmed frauds are in the table?,aggregate_stats
+Should this customer receive a loan?,refuse
+Which stocks should I buy with my savings?,refuse
+Can you waive the fraud flag on my account?,refuse
+Please close my account and refund the transfer.,refuse
+Have we seen anything like case 14532 before?,find_similar_cases
+Is TRANSFER riskier than CASH_OUT?,aggregate_stats
+Pull up the record for 2192,lookup_transaction
+Tell me about the metric the team uses for imbalanced data,search_knowledge

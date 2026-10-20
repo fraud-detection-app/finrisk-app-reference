@@ -1,0 +1,273 @@
+# The deploy steps for ONE environment, written once. Two workflows call this file:
+#
+#   deliver.yml   after a merge into main: dev -> sit -> pre-prod -> prod     (the image of the commit just merged)
+#   rollback.yml  when a person clicks "Run workflow"                          (the image of an older commit)
+#
+# A workflow that other workflows call is a "reusable workflow" (`on: workflow_call`). It is the Actions
+# version of a function: same steps, different inputs. Keeping the deploy in ONE place means a rollback
+# runs exactly the steps a normal deploy runs, with the same guards and the same smoke test.
+#
+# What it does, in order:
+#   1. become the environment's AWS role (OIDC: no stored key) and hide the account id in the log
+#   2. find the image finrisk-app:sha-<commit> in ECR and resolve it to a DIGEST (fail if it was never built)
+#   3. terraform plan + apply for this environment's workspace (deploy/terraform)
+#   4. smoke test: wait until the NEW image answers /health (same digest), then /ready (model AND index loaded)
+#   5. write a summary table on the run page
+#
+# The model and the knowledge index are NOT part of this deploy. They are SSM pointers moved by the finrisk-ml and
+# finrisk-knowledge pipelines; this deploy only tells the service where to look (POINTER_PREFIX=/finrisk/<env>).
+name: deploy-env
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "dev, sit, pre-prod or prod"
+        type: string
+        required: true
+      sha:
+        description: "the 40-character commit whose image (finrisk-app:sha-<sha>) to deploy"
+        type: string
+        required: true
+      reason:
+        description: "deliver or rollback (only used in the summary)"
+        type: string
+        default: deliver
+    outputs:
+      image_digest:
+        description: "the sha256 digest that was deployed"
+        value: ${{ jobs.deploy.outputs.image_digest }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # bash with `-eo pipefail`: a failing command in a pipe fails the step
+
+# Every job runs on ubuntu-24.04, the image this pipeline was rehearsed on. `ubuntu-latest` moves to Ubuntu 26 on
+# 19 Oct 2026; pin the runner like you pin actions, and move to a new image on purpose, in a pull request.
+jobs:
+  deploy:
+    name: deploy ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60 # ECS Express Mode needs about 13 minutes to answer on the first create
+
+    # THE gate. Naming an Environment does three things: it runs the Environment's protection rules
+    # (a required reviewer on pre-prod and prod; only the main branch may deploy), it makes the
+    # environment's own secret (AWS_ROLE_ARN) visible, and it puts "environment:<name>" in the OIDC
+    # token, which is the only token that environment's AWS role accepts.
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      id-token: write # lets this job ask GitHub for the OIDC token (the key-less login)
+      contents: read
+
+    # One deploy per environment at a time. A second run waits for the first to finish; it is never
+    # cancelled halfway, because a half-finished terraform apply is how state gets stuck.
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+
+    outputs:
+      image_digest: ${{ steps.image.outputs.digest }}
+
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      SHA: ${{ inputs.sha }}
+      REASON: ${{ inputs.reason }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      # Values that contain the AWS account id are SECRETS, only so that the id stays out of this repository's PUBLIC log.
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }} # the full repository URL: <account>.dkr.ecr.<region>.amazonaws.com/finrisk-app
+      TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+      TF_IN_AUTOMATION: "1"
+
+    steps:
+      - name: Check the inputs
+        run: |
+          case "$ENVIRONMENT" in dev|sit|pre-prod|prod) ;; *) echo "::error::environment must be dev, sit, pre-prod or prod, not '$ENVIRONMENT'"; exit 1 ;; esac
+          if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::'$SHA' is not a full commit sha (40 hex characters)."
+            exit 1
+          fi
+          echo "$REASON: deploying the image of commit ${SHA:0:7} to $ENVIRONMENT"
+
+      - uses: actions/checkout@v7
+
+      # ---- 1. AWS, without a key -----------------------------------------------------------------
+      # AWS_ROLE_ARN is an ENVIRONMENT secret: each environment has its own, so this job can only ever
+      # become finrisk-app-deploy-<its own environment>.
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: deploy-${{ inputs.environment }}-${{ github.run_id }}
+
+      # The secrets are hidden already, but Terraform and ECR print NEW strings built from the account id (a role ARN,
+      # an image address). Asking AWS for the id and masking it hides those too.
+      - name: Hide the account id in what AWS prints
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::$ACCOUNT_ID"
+
+      # ---- 2. which image? -----------------------------------------------------------------------
+      # The image was built ONCE, when the commit merged into main, and tagged sha-<commit>. We deploy the DIGEST
+      # (the content hash), not the tag: a digest can never point at a different image.
+      - name: Find the image in ECR
+        id: image
+        run: |
+          ECR_NAME="${ECR_REPOSITORY##*/}" # the repository name: the part after the last "/"
+          if ! DIGEST="$(aws ecr describe-images --repository-name "$ECR_NAME" --image-ids "imageTag=sha-$SHA" --query 'imageDetails[0].imageDigest' --output text 2>"$RUNNER_TEMP/ecr.err")"; then
+            if grep -q ImageNotFoundException "$RUNNER_TEMP/ecr.err"; then
+              echo "::error title=No image for this commit::There is no image sha-$SHA in the registry. Images are built when a pull request merges into main; to roll back, use the sha of a commit that was merged and built."
+            else
+              cat "$RUNNER_TEMP/ecr.err"
+            fi
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_URI=$ECR_REPOSITORY@$DIGEST" >> "$GITHUB_ENV"
+          echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "found sha-$SHA -> $DIGEST"
+
+      # ---- 3. Terraform --------------------------------------------------------------------------
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      # The state lives in the shared S3 bucket; one workspace (= one state file) per environment.
+      # The backend settings are not in the code: they differ per account, so they come from secrets and variables.
+      - name: terraform init, workspace
+        working-directory: deploy/terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=app/service.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+          terraform workspace select -or-create "$ENVIRONMENT"
+
+      - name: terraform plan
+        working-directory: deploy/terraform
+        run: |
+          terraform plan -input=false -no-color -out=tfplan \
+            -var-file="envs/$ENVIRONMENT.tfvars" \
+            -var "aws_region=$AWS_REGION" \
+            -var "image_uri=$IMAGE_URI"
+
+      # Applies exactly the plan printed above (not a fresh one). ECS Express Mode returns in seconds,
+      # but the service needs about 13 minutes before it answers: the smoke test below waits for that.
+      - name: terraform apply
+        working-directory: deploy/terraform
+        run: |
+          started=$SECONDS
+          terraform apply -input=false -no-color tfplan
+          echo "APPLY_SECONDS=$((SECONDS - started))" >> "$GITHUB_ENV"
+          {
+            echo "APP_URL=$(terraform output -raw url)"
+            echo "APP_COMPUTE=$(terraform output -raw compute)"
+            echo "LOG_GROUP=$(terraform output -raw log_group)"
+          } >> "$GITHUB_ENV"
+
+      # ---- 4. smoke test -------------------------------------------------------------------------
+      # "Deployed" is not "working", and "something answered 200" is not "the NEW version answered".
+      # We wait until /health answers 200 AND reports the digest we just deployed (the app reads it from
+      # APP_IMAGE_DIGEST, which Terraform sets). Why: during an ECS Express rolling update the OLD task
+      # keeps answering 200 until the new one is healthy; a plain 200 check would pass against the old version.
+      # (Lambda switches versions at once, but the same check holds.)
+      # Then /ready: does it have a model AND a knowledge index loaded? (/ready is 503 until both are.)
+      # A failure stops the pipeline: nothing above this environment will be promoted. We RETRY because the first
+      # call after a deploy can fail:
+      #   - Lambda: a cold start that runs past the 10 s init limit answers 502 once (the next call works).
+      #   - ECS Express: the load balancer returns 503/000 for the first ~13 minutes of a new service.
+      - name: Smoke test /health and /ready
+        run: |
+          if [ -z "$APP_URL" ]; then echo "::error::terraform returned no url output."; exit 1; fi
+          if [ "$APP_COMPUTE" = ecs ]; then HEALTH_BUDGET=1080; READY_TRIES=60; else HEALTH_BUDGET=300; READY_TRIES=30; fi   # seconds for /health; tries for /ready
+          started=$SECONDS
+          echo "testing $APP_URL  (compute: $APP_COMPUTE, waiting up to $HEALTH_BUDGET s for /health)"
+          echo "expecting image ${IMAGE_DIGEST:0:19}..."
+
+          probe() { # probe <path> <outfile>  ->  prints "<http code> <seconds>"
+            rm -f "$2" # never read the answer of an earlier try
+            curl -s -o "$2" -w '%{http_code} %{time_total}\n' --max-time 45 "$APP_URL$1" || true
+          }
+          field() { # field <json file> <name>  ->  the value, or nothing (missing file, not JSON, null)
+            python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print("" if v is None else v)' "$1" "$2" 2>/dev/null || true
+          }
+
+          n=0
+          while :; do
+            read -r code secs < <(probe /health "$RUNNER_TEMP/health.json")
+            seen="$(field "$RUNNER_TEMP/health.json" image_digest)"
+            if [ "$code" = 200 ] && [ "$seen" = "$IMAGE_DIGEST" ]; then break; fi
+            n=$((n + 1))
+            if [ "$code" = 200 ]; then
+              echo "  [$((SECONDS - started)) s] /health -> 200 (${secs}s) but image_digest is '${seen:-none}': old version still answering, try $n"
+            else
+              echo "  [$((SECONDS - started)) s] /health -> $code (${secs}s), try $n"
+            fi
+            if [ $((SECONDS - started)) -ge "$HEALTH_BUDGET" ]; then
+              if [ "$code" = 200 ]; then
+                echo "::error title=Smoke test::/health answers 200, but still from the old version (image_digest '${seen:-none}', expected $IMAGE_DIGEST) after $HEALTH_BUDGET s."
+              else
+                echo "::error title=Smoke test::/health never answered 200 within $HEALTH_BUDGET s (last: $code)."
+              fi
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "  [$((SECONDS - started)) s] /health -> 200 (${secs}s), image_digest matches"
+
+          why=""
+          for n in $(seq 1 "$READY_TRIES"); do
+            read -r code secs < <(probe /ready "$RUNNER_TEMP/ready.json")
+            why=""
+            if [ "$code" != 200 ]; then
+              why="not ready: /ready -> $code"
+            elif [ "$(field "$RUNNER_TEMP/ready.json" image_digest)" != "$IMAGE_DIGEST" ]; then
+              why="old version still answering (/ready image_digest is '$(field "$RUNNER_TEMP/ready.json" image_digest)')"
+            fi
+            echo "  [$((SECONDS - started)) s] /ready  -> $code (${secs}s), try $n${why:+: $why}"
+            [ -z "$why" ] && break
+            sleep 10
+          done
+          echo "--- /ready said:"; cat "$RUNNER_TEMP/ready.json"; echo
+          if [ -n "$why" ]; then
+            if [ "$code" != 200 ]; then
+              echo "::error title=Not ready::/health is 200 but /ready is $code. The app is up but has no model or no index loaded (see load_error above). This release is NOT promoted. Roll back, or fix it with a new pull request."
+            else
+              echo "::error title=Not the version we deployed::/ready answers 200, but $why. This release is NOT promoted."
+            fi
+            exit 1
+          fi
+          echo "SMOKE_SECONDS=$((SECONDS - started))" >> "$GITHUB_ENV"
+
+      # ---- when it went wrong: show the app's own log, so nobody has to open the AWS console -------
+      - name: App log (last 15 minutes)
+        if: failure()
+        continue-on-error: true
+        run: aws logs tail "${LOG_GROUP:-/app/finrisk-$ENVIRONMENT}" --since 15m | tail -n 60
+
+      # ---- 5. the summary table on the run page ---------------------------------------------------
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### $REASON to \`$ENVIRONMENT\`: $JOB_STATUS"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| environment | \`$ENVIRONMENT\` (${APP_COMPUTE:-?}) |"
+            echo "| commit | \`${SHA:0:7}\` |"
+            echo "| image digest | \`${IMAGE_DIGEST:-not found}\` |"
+            echo "| url | ${APP_URL:-none} |"
+            echo "| terraform apply | ${APPLY_SECONDS:-?} s |"
+            echo "| smoke test | ${SMOKE_SECONDS:-?} s |"
+            echo ""
+            echo "The model and index versions this environment serves are in \`$APP_URL/ready\` (model.version, index.version)."
+          } >> "$GITHUB_STEP_SUMMARY"

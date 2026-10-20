@@ -1,0 +1,137 @@
+# Delete ONE environment's SERVICE (terraform destroy of deploy/terraform). Run by a person (Actions tab -> Run workflow).
+#
+# What goes: the Lambda function or the ECS Express service, its URL, and the /finrisk/<env>/app_url parameter,
+# plus Terraform's state file for that workspace. What stays: the image (shared ECR), the roles, buckets, log group and
+# SSM pointers (they belong to finrisk-infra), the models and the indexes.
+#
+# Safety:
+#   - you must type the environment's name a second time (`confirm`),
+#   - the branch must be main (the only branch an Environment accepts),
+#   - pre-prod and prod also wait for their reviewer (the Environment's rule).
+# Timing: Lambda environments go in seconds; ECS Express ones take about 8 minutes (the load balancer drains).
+#
+# The order for a FULL teardown of the course: the service first (this workflow, per environment), then the model and
+# knowledge pointers' data if you want it gone, then finrisk-infra's environments, shared stack and bootstrap last.
+name: teardown
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment whose service to DELETE"
+        type: choice
+        options: [dev, sit, pre-prod, prod]
+        required: true
+      confirm:
+        description: "Type the environment name again to confirm"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Every job runs on ubuntu-24.04, the image this pipeline was rehearsed on. `ubuntu-latest` moves to Ubuntu 26 on
+# 19 Oct 2026; pin the runner like you pin actions, and move to a new image on purpose, in a pull request.
+jobs:
+  check:
+    name: sure?
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CONFIRM: ${{ inputs.confirm }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ "$CONFIRM" != "$ENVIRONMENT" ]; then
+            echo "::error title=Not confirmed::You typed '$CONFIRM'. To delete $ENVIRONMENT, type exactly: $ENVIRONMENT"
+            exit 1
+          fi
+          if [ "$BRANCH" != main ]; then
+            echo "::error title=Wrong branch::Choose 'main' in 'Use workflow from' (this run is on '$BRANCH')."
+            exit 1
+          fi
+
+  destroy:
+    name: destroy ${{ inputs.environment }}
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    # Shares the deploy group, so a teardown never runs while a deploy of the same environment is running.
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }} # a secret: it contains the account id, which must not reach the public log
+      TF_IN_AUTOMATION: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: teardown-${{ inputs.environment }}-${{ github.run_id }}
+
+      # Secrets are hidden already; this also hides the NEW strings built from the account id in what AWS prints.
+      - name: Hide the account id in what AWS prints
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::$ACCOUNT_ID"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - name: terraform init, workspace
+        working-directory: deploy/terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=app/service.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+          if ! terraform workspace select "$ENVIRONMENT"; then
+            echo "There is no workspace '$ENVIRONMENT': nothing was deployed here (or it is already gone)."
+            echo "NOTHING_TO_DO=true" >> "$GITHUB_ENV"
+          fi
+
+      # `destroy` still needs every required variable. The image is not changed by a destroy, so we read the
+      # one the state already holds (its output `image_uri`) instead of asking for it again.
+      - name: terraform destroy
+        if: env.NOTHING_TO_DO != 'true'
+        working-directory: deploy/terraform
+        run: |
+          if ! IMAGE_URI="$(terraform output -raw image_uri 2>/dev/null)"; then
+            echo "The state of $ENVIRONMENT has no outputs: nothing to destroy."
+          else
+            terraform destroy -input=false -no-color -auto-approve \
+              -var-file="envs/$ENVIRONMENT.tfvars" \
+              -var "aws_region=$AWS_REGION" \
+              -var "image_uri=$IMAGE_URI"
+          fi
+          # an empty workspace can be deleted (removes its state file); the default workspace must be selected first
+          terraform workspace select default
+          terraform workspace delete "$ENVIRONMENT"
+
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### teardown \`$ENVIRONMENT\`: $JOB_STATUS"
+            echo "The service is gone; roles, bucket, log group and pointers are finrisk-infra's. Check the AWS console (Lambda / ECS) that nothing is left."
+          } >> "$GITHUB_STEP_SUMMARY"

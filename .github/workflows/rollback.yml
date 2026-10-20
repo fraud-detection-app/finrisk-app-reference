@@ -1,0 +1,70 @@
+# Put an OLDER release back into one environment. Run by a person (Actions tab -> Run workflow).
+#
+# A rollback is not a special trick: it is the SAME deploy (deploy-env.yml) pointed at an image that was
+# already built and already passed. Nothing is rebuilt. Every release is an image in ECR named after its commit
+# (sha-<40 hex>), so "go back" means "deploy that commit's image again".
+#
+# How to run it:
+#   1. "Use workflow from": main. GitHub only lets an environment deploy from main, so any other branch is stopped.
+#   2. environment: the one to fix.
+#   3. sha: the full commit sha of the good release. Find it in the summary of an older deliver run, or in
+#      `git log` / the Releases page (a release's notes name its commit).
+#
+# The Terraform code stays that of main's latest commit; only the IMAGE goes back. The model and the knowledge
+# index are not touched: they have their own rollbacks (finrisk-ml promote-model, finrisk-knowledge promote-index).
+# The environment's usual rules still apply: pre-prod and prod wait for their reviewer.
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to roll back"
+        type: choice
+        options: [dev, sit, pre-prod, prod]
+        required: true
+      sha:
+        description: "Full commit sha (40 hex characters) of the release to restore. Its image sha-<sha> must exist in ECR."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Every job runs on ubuntu-24.04, the image this pipeline was rehearsed on. `ubuntu-latest` moves to Ubuntu 26 on
+# 19 Oct 2026; pin the runner like you pin actions, and move to a new image on purpose, in a pull request.
+jobs:
+  check:
+    name: right branch and a real sha?
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          if [ "$BRANCH" != main ]; then
+            echo "::error title=Wrong branch::Environments deploy from main only. Choose 'main' in 'Use workflow from' (this run is on '$BRANCH')."
+            exit 1
+          fi
+          if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Not a sha::'$SHA' is not a full commit sha (40 hex characters)."
+            exit 1
+          fi
+
+  rollback:
+    name: roll back ${{ inputs.environment }}
+    needs: check
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: ${{ inputs.environment }}
+      sha: ${{ inputs.sha }}
+      reason: rollback
+    secrets: inherit # see deliver.yml: the called workflow reads the repository and environment secrets

@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Risk Assistant</title>
+<!--
+  The week-10 web app. One file, no CDN, no build step: plain HTML, CSS and fetch() against the
+  same-origin API. It is a conversation, not a dashboard -- ask in words, get an answer with its
+  evidence attached (the transaction, the sources, the tool the agent chose, and the model that
+  wrote it). Every answer's footer says which model ran, how long it took and what it cost.
+-->
+<style>
+  /* Layout: sidebar (workspace + status) | conversation (thread above, composer below). */
+  :root {
+    --bg: #F4F5F7; --panel: #FFFFFF; --sidebar: #ECEEF1; --raised: #F8F9FA;
+    --ink: #1B2027; --ink-2: #434A55; --muted: #69717D; --line: #DADEE4; --line-soft: #E7EAEE;
+    --accent: #D5402A; --accent-ink: #FFFFFF; --accent-soft: #FCEBE7;
+    --high: #BF2B2B; --high-soft: #FBE8E8; --low: #1D7443; --low-soft: #E2F3E8;
+    --warn: #845600; --warn-soft: #FFF2D4; --info: #1E5BB8; --info-soft: #E5EDFA;
+    --bubble: #1B2027; --bubble-ink: #FFFFFF;
+    --shadow: 0 1px 2px rgba(18,22,28,.05), 0 8px 24px rgba(18,22,28,.06);
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0E1115; --panel: #161A20; --sidebar: #111419; --raised: #1B2027;
+      --ink: #E6E9ED; --ink-2: #C1C7CF; --muted: #8C95A1; --line: #272D35; --line-soft: #1F242B;
+      --accent: #FF6B4E; --accent-ink: #1B0D09; --accent-soft: #2D1611;
+      --high: #FF7070; --high-soft: #331819; --low: #4CC287; --low-soft: #11291D;
+      --warn: #E6B444; --warn-soft: #2B2211; --info: #7EAEF7; --info-soft: #132338;
+      --bubble: #2A313A; --bubble-ink: #F2F4F6;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.3);
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0E1115; --panel: #161A20; --sidebar: #111419; --raised: #1B2027;
+    --ink: #E6E9ED; --ink-2: #C1C7CF; --muted: #8C95A1; --line: #272D35; --line-soft: #1F242B;
+    --accent: #FF6B4E; --accent-ink: #1B0D09; --accent-soft: #2D1611;
+    --high: #FF7070; --high-soft: #331819; --low: #4CC287; --low-soft: #11291D;
+    --warn: #E6B444; --warn-soft: #2B2211; --info: #7EAEF7; --info-soft: #132338;
+    --bubble: #2A313A; --bubble-ink: #F2F4F6;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.3);
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--sans); -webkit-text-size-adjust: 100%; }
+  button, input, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  code, .mono { font-family: var(--mono); font-size: .9em; }
+  [hidden] { display: none !important; }
+
+  /* The window never scrolls; the thread does. Grid and flex items default to min-height:auto
+     (grow to fit their content), which would let a long conversation push the whole page -- and
+     the sidebar with it -- to scroll. minmax(0, 1fr) and min-height: 0 keep every panel viewport-sized. */
+  .app { display: grid; grid-template-columns: 276px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr);
+         height: 100%; height: 100dvh; overflow: hidden; }
+
+  /* ------------------------------------------------------------------ sidebar */
+  .sidebar { background: var(--sidebar); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0;
+             gap: 20px; padding: 18px 16px calc(16px + env(safe-area-inset-bottom, 0px)); overflow-y: auto; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .mark { width: 34px; height: 34px; border-radius: 10px; background: var(--accent); color: var(--accent-ink);
+          display: grid; place-items: center; flex: none; }
+  .brand b { display: block; font-size: 15.5px; letter-spacing: -.01em; }
+  .brand small { color: var(--muted); font-size: 12.5px; }
+  .new-chat { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 12px; border-radius: 10px;
+              border: 1px solid var(--line); background: var(--panel); font-weight: 600; font-size: 14px; }
+  .new-chat:hover { border-color: var(--muted); }
+  .side-label { font-size: 11.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+  .prompts { display: flex; flex-direction: column; gap: 2px; }
+  .prompts button { text-align: left; background: none; border: 0; border-radius: 8px; padding: 7px 10px; color: var(--ink-2); font-size: 14px; }
+  .prompts button:hover { background: var(--panel); color: var(--ink); }
+  .side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 12px; }
+  .status { background: var(--panel); border: 1px solid var(--line-soft); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 7px; }
+  .status-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); }
+  .status-row span:last-child { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--low); } .dot.bad { background: var(--high); } .dot.warn { background: var(--warn); }
+  .model-card b { font-family: var(--mono); font-size: 13.5px; }
+  .model-card p { margin: 0; font-size: 12.5px; color: var(--muted); }
+  .disclaimer { font-size: 11.5px; color: var(--muted); }
+
+  /* ------------------------------------------------------------------ main */
+  .chat { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; }
+  .topbar { display: flex; align-items: center; gap: 12px; padding: calc(10px + env(safe-area-inset-top, 0px)) 20px 10px;
+            border-bottom: 1px solid var(--line); background: var(--panel); }
+  .menu { display: none; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; width: 36px; height: 36px; place-items: center; }
+  .topbar h1 { font-size: 15px; font-weight: 600; margin: 0; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .modelpill { position: relative; }
+  .modelpill summary { list-style: none; display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
+                       border: 1px solid var(--line); background: var(--raised); font-size: 13px; cursor: pointer; white-space: nowrap; }
+  .modelpill summary::-webkit-details-marker { display: none; }
+  .modelpill summary b { font-family: var(--mono); font-weight: 600; }
+  .modelpill .pop { position: absolute; right: 0; top: calc(100% + 8px); width: min(320px, 86vw); background: var(--panel);
+                    border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); padding: 14px 16px; z-index: 20; font-size: 13px; }
+  .pop dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; margin: 0; }
+  .pop dt { color: var(--muted); } .pop dd { margin: 0; overflow-wrap: anywhere; }
+
+  .thread { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 28px 20px 12px; }
+  .thread-inner { max-width: 800px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+
+  /* ------------------------------------------------------------------ empty state */
+  .welcome { padding: 6vh 0 0; }
+  .welcome h2 { font-size: clamp(24px, 3.4vw, 32px); letter-spacing: -.02em; line-height: 1.15; margin: 0 0 8px; text-wrap: balance; }
+  .welcome > p { color: var(--muted); margin: 0 0 24px; max-width: 58ch; }
+  .starters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .starter { text-align: left; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px;
+             display: flex; flex-direction: column; gap: 4px; transition: border-color .15s, transform .15s; }
+  .starter:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .starter b { font-size: 14px; } .starter span { font-size: 13.5px; color: var(--muted); }
+
+  /* ------------------------------------------------------------------ messages */
+  .msg-user { align-self: flex-end; max-width: min(78%, 620px); background: var(--bubble); color: var(--bubble-ink);
+              padding: 10px 15px; border-radius: 18px 18px 4px 18px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg-user .mode { display: block; font-size: 11px; opacity: .65; margin-bottom: 2px; letter-spacing: .04em; text-transform: uppercase; }
+  .msg-bot { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 12px; }
+  .avatar { width: 32px; height: 32px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; }
+  .bot-body { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding-top: 4px; }
+  .answer { font-size: 15.5px; line-height: 1.62; overflow-wrap: anywhere; }
+  .answer p { margin: 0 0 .6em; } .answer p:last-child { margin-bottom: 0; }
+  .cite { display: inline-block; font: 11.5px/1.6 var(--mono); background: var(--info-soft); color: var(--info); padding: 0 6px; border-radius: 6px; margin: 0 2px; vertical-align: 1px; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; min-width: 0; }
+  .card-head { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
+  .card-head h3 { margin: 0; font-size: 16px; letter-spacing: -.01em; }
+  .card-head p { margin: 2px 0 0; color: var(--muted); font-size: 13.5px; font-variant-numeric: tabular-nums; }
+  .badge { margin-left: auto; font-size: 12.5px; font-weight: 700; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
+  .badge.high { background: var(--high-soft); color: var(--high); } .badge.low { background: var(--low-soft); color: var(--low); }
+  .meter { position: relative; height: 10px; border-radius: 99px; background: var(--line-soft); margin: 26px 0 30px; }
+  .meter i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 99px; }
+  .meter i.high { background: var(--high); } .meter i.low { background: var(--low); }
+  .meter .tick { position: absolute; top: -6px; bottom: -6px; width: 2px; background: var(--ink); }
+  .meter .tick span { position: absolute; top: 18px; left: 50%; transform: translateX(-50%); font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .meter .score { position: absolute; bottom: 16px; font: 600 12px var(--mono); white-space: nowrap; transform: translateX(-50%); }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .fact { background: var(--raised); border-radius: 10px; padding: 9px 12px; }
+  .fact small { display: block; color: var(--muted); font-size: 11.5px; letter-spacing: .04em; text-transform: uppercase; }
+  .fact b { font-size: 14px; }
+  .reasons { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .reasons li { display: flex; gap: 10px; align-items: baseline; font-size: 14px; }
+  .arrow { font: 700 12px var(--mono); flex: none; width: 18px; }
+  .arrow.up { color: var(--high); } .arrow.down { color: var(--low); }
+  .summary { margin-top: 14px; border-top: 1px solid var(--line-soft); padding-top: 12px; font-size: 14.5px; }
+  .summary small { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .ghost { border: 1px solid var(--line); background: var(--raised); border-radius: 8px; padding: 6px 12px; font-size: 13.5px; }
+  .ghost:hover { border-color: var(--muted); }
+
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th { text-align: left; font-size: 11.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 600; padding: 0 10px 8px 0; }
+  td { padding: 7px 10px 7px 0; border-top: 1px solid var(--line-soft); white-space: nowrap; }
+  td.bar { width: 40%; min-width: 120px; }
+  td.bar div { height: 8px; border-radius: 99px; background: var(--accent); min-width: 2px; }
+  td.bar.top div { background: var(--high); }
+  .neighbours { display: flex; flex-direction: column; gap: 6px; }
+  .neighbour { display: flex; align-items: center; gap: 12px; padding: 8px 10px; border-radius: 10px; background: var(--raised); font-size: 14px; font-variant-numeric: tabular-nums; }
+  .neighbour b { font-family: var(--mono); } .neighbour span { color: var(--muted); }
+  .neighbour button { margin-left: auto; }
+  .note { font-size: 13px; color: var(--muted); margin: 10px 0 0; }
+
+  .sources { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .sources small { color: var(--muted); font-size: 12px; margin-right: 2px; }
+  .source { font: 12px var(--mono); border: 1px solid var(--line); border-radius: 8px; padding: 3px 8px; background: var(--panel); color: var(--ink-2); }
+
+  .notice { border-radius: 12px; padding: 12px 14px; font-size: 14.5px; display: flex; gap: 10px; }
+  .notice.warn { background: var(--warn-soft); color: var(--warn); }
+  .notice.err { background: var(--high-soft); color: var(--high); }
+  .notice b { display: block; }
+  .notice p { margin: 2px 0 0; color: var(--ink-2); }
+
+  .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; border-radius: 999px;
+          background: var(--raised); border: 1px solid var(--line-soft); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .chip.llm { background: var(--info-soft); border-color: transparent; color: var(--info); }
+  .chip.offline { background: var(--raised); color: var(--muted); }
+  .chip.fail { background: var(--warn-soft); border-color: transparent; color: var(--warn); }
+  .chip b { font-family: var(--mono); font-weight: 600; }
+  details.trace { font-size: 13px; color: var(--muted); }
+  details.trace summary { cursor: pointer; width: fit-content; }
+  details.trace ol { margin: 8px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 3px; }
+  details.trace li b { color: var(--ink-2); font-weight: 600; display: inline-block; min-width: 70px; }
+
+  .thinking { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; }
+  .dots { display: inline-flex; gap: 4px; }
+  .dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
+  .dots i:nth-child(2) { animation-delay: .2s; } .dots i:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .dots i { animation: none; } .starter { transition: none; } }
+
+  /* ------------------------------------------------------------------ composer */
+  .composer-wrap { padding: 8px 20px calc(16px + env(safe-area-inset-bottom, 0px)); }
+  .composer { max-width: 800px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
+              box-shadow: var(--shadow); padding: 10px 10px 10px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .composer:focus-within { border-color: var(--muted); }
+  .composer textarea { border: 0; outline: 0; resize: none; background: transparent; min-height: 26px; max-height: 200px;
+                       line-height: 1.5; padding: 4px 0; font-size: 15.5px; }
+  .composer-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .modes { display: inline-flex; background: var(--raised); border: 1px solid var(--line-soft); border-radius: 10px; padding: 3px; }
+  .modes button { border: 0; background: none; padding: 5px 12px; border-radius: 7px; font-size: 13.5px; color: var(--muted); font-weight: 600; }
+  .modes button[aria-pressed="true"] { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); }
+  .send { margin-left: auto; width: 38px; height: 38px; border-radius: 12px; border: 0; background: var(--accent); color: var(--accent-ink); display: grid; place-items: center; }
+  .send:disabled { opacity: .45; cursor: default; }
+  .composer-hint { max-width: 800px; margin: 6px auto 0; font-size: 12px; color: var(--muted); text-align: center; }
+
+  .scrim { display: none; }
+  @media (max-width: 860px) {
+    .app { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { position: fixed; inset: 0 auto 0 0; width: min(300px, 86vw); z-index: 40; transform: translateX(-100%); transition: transform .2s; box-shadow: var(--shadow); }
+    .app.nav-open .sidebar { transform: none; }
+    .app.nav-open .scrim { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 30; }
+    .menu { display: grid; }
+    .starters { grid-template-columns: minmax(0, 1fr); }
+    .msg-user { max-width: 88%; }
+    .modelpill summary .long { display: none; }
+  }
+  @media (max-width: 480px) {
+    .thread, .composer-wrap, .topbar { padding-left: 16px; padding-right: 16px; }
+    .msg-bot { grid-template-columns: minmax(0, 1fr); }
+    .avatar { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="sidebar" id="sidebar" aria-label="Workspace">
+    <div class="brand">
+      <div class="mark" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg>
+      </div>
+      <div><b>Risk Assistant</b><small>Fraud review workspace</small></div>
+    </div>
+
+    <button class="new-chat" id="newChat" type="button">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      New conversation
+    </button>
+
+    <div>
+      <p class="side-label">Try asking</p>
+      <div class="prompts" id="sidePrompts"></div>
+    </div>
+
+    <div class="side-foot">
+      <div class="status" aria-label="Service status">
+        <p class="side-label" style="margin:0">Service</p>
+        <div class="status-row"><i class="dot" id="dData"></i><span>Transactions</span><span id="vData">—</span></div>
+        <div class="status-row"><i class="dot" id="dModel"></i><span>Risk model</span><span id="vModel">—</span></div>
+        <div class="status-row"><i class="dot" id="dIndex"></i><span>Knowledge base</span><span id="vIndex">—</span></div>
+      </div>
+      <div class="status model-card" aria-label="Language model">
+        <p class="side-label" style="margin:0">Language model</p>
+        <div class="status-row"><i class="dot" id="dLlm"></i><b id="vLlm">checking…</b></div>
+        <p id="pLlm"></p>
+      </div>
+      <p class="disclaimer">Educational demo. Not financial, lending, legal or investment advice.</p>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <main class="chat">
+    <header class="topbar">
+      <button class="menu" id="menu" type="button" aria-label="Open the workspace menu">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <h1 id="title">New conversation</h1>
+      <details class="modelpill" id="modelPill">
+        <summary><i class="dot" id="pillDot"></i><span class="long">Model</span><b id="pillModel">…</b></summary>
+        <div class="pop" id="pillPop"></div>
+      </details>
+    </header>
+
+    <section class="thread" id="thread" aria-live="polite">
+      <div class="thread-inner" id="threadInner"></div>
+    </section>
+
+    <div class="composer-wrap">
+      <form class="composer" id="composer">
+        <label for="input" class="visually-hidden" hidden>Message</label>
+        <textarea id="input" rows="1" placeholder="Ask about a transaction, the model, or the portfolio…" autocomplete="off"></textarea>
+        <div class="composer-bar">
+          <div class="modes" role="group" aria-label="Answer with">
+            <button type="button" data-mode="auto" aria-pressed="true" title="The agent picks the right tool">Auto</button>
+            <button type="button" data-mode="docs" aria-pressed="false" title="Answer from the project documents">Docs</button>
+            <button type="button" data-mode="score" aria-pressed="false" title="Score a stored transaction by id">Score</button>
+          </div>
+          <label class="toggle" id="summaryToggle" hidden><input type="checkbox" id="useLlm"> AI summary</label>
+          <button class="send" id="send" type="submit" aria-label="Send" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </button>
+        </div>
+      </form>
+      <p class="composer-hint" id="hint">Enter to send · Shift + Enter for a new line</p>
+    </div>
+  </main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = (n, d = 2) => Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+const pct = (n) => `${(Number(n) * 100).toFixed(n < 0.1 ? 2 : 1)}%`;
+
+const MODES = {
+  auto: { label: "Auto", placeholder: "Ask about a transaction, the model, or the portfolio…" },
+  docs: { label: "Docs", placeholder: "Ask a question about the project, the model or the data…" },
+  score: { label: "Score", placeholder: "Enter a transaction id to score, e.g. 451" },
+};
+const STORE = "risk-assistant-conversation-v1";
+const state = { mode: "auto", messages: [], busy: false, llm: null, samples: { any: null, high: null } };
+
+// -------------------------------------------------------------------- storage
+function save() { try { localStorage.setItem(STORE, JSON.stringify(state.messages.slice(-60))); } catch (_) {} }
+function load() { try { return JSON.parse(localStorage.getItem(STORE) || "[]"); } catch (_) { return []; } }
+
+// -------------------------------------------------------------------- api
+async function call(path, options = {}) {
+  let response;
+  try {
+    response = await fetch(path, { headers: { "content-type": "application/json" }, ...options });
+  } catch (err) {
+    return { ok: false, status: 0, data: { error: "unreachable", detail: "The service is not responding. Is the server running?" }, rid: null };
+  }
+  let data = {};
+  try { data = await response.json(); } catch (_) {}
+  return { ok: response.ok, status: response.status, data, rid: response.headers.get("x-request-id") };
+}
+
+// -------------------------------------------------------------------- status
+async function refreshStatus() {
+  const r = await call("/ready");
+  const d = r.data || {};
+  const checks = d.checks || {};
+  const set = (dot, val, ok, text) => { $(dot).className = "dot " + (ok ? "ok" : "bad"); $(val).textContent = text; };
+  set("dData", "vData", checks.gold_features, checks.gold_features ? (d.rows ? d.rows.toLocaleString() : "ready") : "missing");
+  set("dModel", "vModel", checks.model_artifact, checks.model_artifact ? (d.model.source === "baked" ? "baked demo" : `v${d.model.version}`) : "missing");
+  set("dIndex", "vIndex", checks.vector_index, checks.vector_index ? `${d.index.chunks} chunks · ${d.index.embeddings}` : "missing");
+  state.llm = d.llm || null;
+  renderModel();
+}
+
+function llmState(l) {
+  if (!l || l.provider === "none") return { cls: "", name: "No LLM", line: "Offline: template summaries, extractive answers, keyword routing." };
+  if (!l.ready) return { cls: "bad", name: l.model || l.provider, line: l.detail };
+  if (l.verified === false) return { cls: "bad", name: l.model, line: `Check failed: ${l.verify_detail}` };
+  if (l.verified === true) return { cls: "ok", name: l.model, line: `Verified · used for ${l.uses.join(", ")}.` };
+  return { cls: "warn", name: l.model, line: `Configured, not yet verified · used for ${l.uses.join(", ")}.` };
+}
+
+function renderModel() {
+  const l = state.llm, s = llmState(l);
+  $("dLlm").className = "dot " + s.cls; $("vLlm").textContent = s.name; $("pLlm").textContent = s.line;
+  $("pillDot").className = "dot " + s.cls; $("pillModel").textContent = s.name;
+  const rows = l ? [
+    ["Provider", l.provider], ["Model", l.model || "—"], ["Endpoint", l.endpoint || "—"],
+    ["Status", l.provider === "none" ? "not configured" : (l.verify_detail || l.detail)],
+    ["Used for", l.uses && l.uses.length ? l.uses.join(", ") : "nothing — answers are produced offline"],
+  ] : [["Status", "The service did not answer /ready."]];
+  $("pillPop").innerHTML = `<dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+    <p class="note">Each answer's footer shows the model the provider reported, its latency and tokens. The server log shows the same, per request.</p>`;
+}
+
+async function loadSamples() {
+  const [any, high] = await Promise.all([call("/api/transactions/sample?limit=1"), call("/api/transactions/sample?limit=1&high_risk=true")]);
+  state.samples.any = any.ok ? any.data.row_ids[0] : null;
+  state.samples.high = high.ok ? high.data.row_ids[0] : state.samples.any;
+  renderPrompts();
+  if (!state.messages.length) render();
+}
+
+function starters() {
+  const a = state.samples.any ?? 451, h = state.samples.high ?? a;
+  return [
+    { title: "Look up a transaction", text: `Pull up transaction ${h}` },
+    { title: "Compare with known fraud", text: `Show me cases similar to transaction ${h}` },
+    { title: "Portfolio view", text: "What is the fraud rate by transaction type?" },
+    { title: "How the model works", text: "What is PR-AUC and why do we use it?" },
+  ];
+}
+function renderPrompts() {
+  const a = state.samples.any ?? 451;
+  const list = [...starters().map((s) => s.text), `Is transaction ${a} fraud?`, "Score a new transfer of 181,000", "Which features matter most to the model?"];
+  $("sidePrompts").innerHTML = list.map((t) => `<button type="button" data-ask="${esc(t)}">${esc(t)}</button>`).join("");
+}
+
+// -------------------------------------------------------------------- rendering
+function textToHtml(text) {
+  const withCites = esc(text).replace(/\[([^\[\]]{2,90})\]/g, '<span class="cite">$1</span>');
+  return withCites.split(/\n{2,}/).map((p) => `<p>${p.replace(/\n/g, "<br>")}</p>`).join("");
+}
+
+function llmChips(calls) {
+  if (!calls || !calls.length) return "";
+  return calls.map((c) => c.ok
+    ? `<span class="chip llm" title="${esc(c.provider)} · ${esc(c.purpose)}"><b>${esc(c.model)}</b> ${esc(c.purpose.replace("_", " "))} · ${Math.round(c.latency_ms)} ms${c.prompt_tokens != null ? ` · ${c.prompt_tokens}→${c.completion_tokens} tok` : ""}</span>`
+    : `<span class="chip fail" title="${esc(c.error)}"><b>${esc(c.model)}</b> ${esc(c.purpose.replace("_", " "))} failed → fallback</span>`).join("");
+}
+
+function reasonRow(reason) {
+  const up = /pushes risk up|increase/i.test(reason), down = /pushes risk down|decrease/i.test(reason);
+  const clean = esc(reason).replace(/`([^`]+)`/g, "<code>$1</code>");
+  return `<li><span class="arrow ${up ? "up" : down ? "down" : ""}">${up ? "▲" : down ? "▼" : "•"}</span><span>${clean}</span></li>`;
+}
+
+function transactionCard(t) {
+  // t: {row_id, transaction_type, amount, score, threshold, level, confirmed (true/false/null), reasons, reason_method, summary, summary_source, summary_model, isNew, unspecified}
+  const level = t.level === "high" ? "high" : "low";
+  const scorePct = Math.max(0, Math.min(100, t.score * 100));
+  const thrPct = Math.max(0, Math.min(100, t.threshold * 100));
+  const outcome = t.isNew ? "Unsettled — no label yet" : t.confirmed === true ? "Confirmed fraud" : t.confirmed === false ? "Not fraud" : "No outcome recorded";
+  const title = t.isNew ? "New transaction" : `Transaction #${esc(t.row_id)}`;
+  const sub = [t.transaction_type, t.amount != null ? fmt(t.amount) : null].filter(Boolean).map(esc).join(" · ");
+  const summary = t.summary ? `<div class="summary"><small>Summary · ${t.summary_source === "template" ? "template (no LLM)" : `written by ${esc(t.summary_model || t.summary_source)}`}</small>${esc(t.summary)}</div>` : "";
+  const actions = t.isNew ? "" : `<div class="card-actions">
+      <button class="ghost" type="button" data-ask="Show me cases similar to transaction ${esc(t.row_id)}">Find similar fraud cases</button>
+      <button class="ghost" type="button" data-score="${esc(t.row_id)}">Score with AI summary</button></div>`;
+  const extra = t.unspecified && t.unspecified.length ? `<p class="note">${t.unspecified.length} feature(s) were not stated and came from a template row, so treat this score as a partial guess.</p>` : "";
+  return `<div class="card">
+    <div class="card-head"><div><h3>${title}</h3><p>${sub}</p></div><span class="badge ${level}">${level === "high" ? "High risk" : "Low risk"}</span></div>
+    <div class="meter" aria-label="Risk score ${t.score.toFixed(4)} against threshold ${t.threshold.toFixed(4)}">
+      <i class="${level}" style="width:${scorePct}%"></i>
+      <span class="score" style="left:${Math.min(94, Math.max(6, scorePct))}%">${t.score.toFixed(4)}</span>
+      <span class="tick" style="left:${thrPct}%"><span>threshold ${t.threshold.toFixed(4)}</span></span>
+    </div>
+    <div class="facts">
+      <div class="fact"><small>Investigation</small><b>${outcome}</b></div>
+      <div class="fact"><small>Reasons from</small><b>${t.reason_method === "shap" ? "SHAP values" : esc(t.reason_method || "—")}</b></div>
+    </div>
+    ${t.reasons && t.reasons.length ? `<ul class="reasons">${t.reasons.slice(0, 4).map(reasonRow).join("")}</ul>` : ""}
+    ${summary}${extra}${actions}
+  </div>`;
+}
+
+function aggregateCard(d) {
+  const rows = [...d.rows].sort((a, b) => b.fraud_rate - a.fraud_rate);
+  const max = Math.max(...rows.map((r) => r.fraud_rate), 1e-9);
+  return `<div class="card"><div class="card-head"><div><h3>Fraud rate by ${esc(d.group_by.replace("_", " "))}</h3>
+    <p>${Number(d.total_transactions).toLocaleString()} transactions · ${Number(d.total_confirmed_frauds).toLocaleString()} confirmed frauds</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>${esc(d.group_by.replace("_", " "))}</th><th>Transactions</th><th>Frauds</th><th>Rate</th><th></th></tr></thead><tbody>
+    ${rows.map((r, i) => `<tr><td><b>${esc(r[d.group_by])}</b></td><td>${Number(r.transactions).toLocaleString()}</td><td>${Number(r.confirmed_frauds).toLocaleString()}</td><td>${pct(r.fraud_rate)}</td>
+      <td class="bar ${i === 0 && r.fraud_rate > 0 ? "top" : ""}"><div style="width:${(r.fraud_rate / max) * 100}%"></div></td></tr>`).join("")}
+    </tbody></table></div></div>`;
+}
+
+function similarCard(d) {
+  const n = d.neighbours || [];
+  return `<div class="card"><div class="card-head"><div><h3>Closest confirmed frauds to #${esc(d.row_id)}</h3><p>Ranked by distance in the model's feature space</p></div></div>
+    <div class="neighbours">${n.map((x) => `<div class="neighbour"><b>#${esc(x.row_id)}</b><span>${esc(x.transaction_type)} · ${fmt(x.amount)}</span><span>distance ${Number(x.distance).toFixed(2)}</span>
+      <button class="ghost" type="button" data-ask="Pull up transaction ${esc(x.row_id)}">Open</button></div>`).join("")}</div>
+    <p class="note">Similar is not the same as fraudulent: these are cases the model sees as structurally alike.</p></div>`;
+}
+
+function sources(citations) {
+  if (!citations || !citations.length) return "";
+  return `<div class="sources"><small>Sources</small>${citations.map((c) => `<span class="source" title="similarity ${c.score ?? ""}">${esc(c.source)}${c.section ? " § " + esc(c.section) : ""}</span>`).join("")}</div>`;
+}
+
+function traceBlock(trace, routeMethod) {
+  if (!trace || !trace.length) return "";
+  return `<details class="trace"><summary>How I answered · ${trace.length} steps${routeMethod && routeMethod !== "not routed" ? " · routed by " + esc(routeMethod) : ""}</summary>
+    <ol>${trace.map((s) => `<li><b>${esc(s.stage)}</b> ${esc(s.detail)}</li>`).join("")}</ol></details>`;
+}
+
+const REFUSALS = {
+  out_of_policy: ["Outside what I can advise on", "I can explain the data, the model and the evidence, but not make lending, investment, legal or account decisions."],
+  low_similarity: ["Not in the project documents", "Nothing in the knowledge base matched closely enough to answer from. Try asking about the data, model, metrics or policy."],
+  no_route: ["I couldn't tell which tool answers that", "Try naming a transaction id, asking about the model or the documents, or asking for a breakdown."],
+  missing_arguments: ["I need a little more detail", ""],
+};
+
+function botBody(m) {
+  const d = m.data || {};
+  if (m.kind === "error") {
+    return `<div class="notice err"><div><b>Couldn't answer${m.status ? ` · ${m.status}` : ""}${d.error ? ` ${esc(d.error)}` : ""}</b>
+      <p>${esc(typeof d.detail === "string" ? d.detail : "The request was not valid.")}${d.hint ? " " + esc(d.hint) : ""}${m.rid ? ` <span class="mono">(request ${esc(m.rid)})</span>` : ""}</p></div></div>`;
+  }
+  if (m.kind === "hint") return `<div class="notice warn"><div><b>${esc(m.title)}</b><p>${esc(m.text)}</p></div></div>`;
+
+  let html = "", meta = [];
+  if (m.kind === "predict") {
+    html += transactionCard({ row_id: d.row_id, transaction_type: d.transaction_type, amount: d.amount, score: d.risk_score, threshold: d.threshold,
+      level: d.risk_level, confirmed: d.confirmed_fraud, reasons: d.reasons, reason_method: d.reason_method, summary: d.summary,
+      summary_source: d.summary_source, summary_model: d.summary_model });
+    meta.push(`<span class="chip">risk model · ${Math.round(d.elapsed_ms)} ms</span>`);
+    meta.push(llmChips(d.llm_calls));
+    const answeredByModel = (d.llm_calls || []).some((c) => c.ok);
+    if (d.summary_source === "template" && answeredByModel)
+      meta.push(`<span class="chip fail" title="The model replied, but its summary failed the week-8 validation gates">model reply rejected → template summary</span>`);
+    else if (d.summary_source === "template") meta.push(`<span class="chip offline">summary: template · no LLM</span>`);
+  }
+  if (m.kind === "ask" || m.kind === "agent") {
+    if (d.refused) {
+      const [t, x] = REFUSALS[d.refusal_reason] || ["I can't answer that", ""];
+      html += `<div class="notice warn"><div><b>${esc(t)}</b><p>${esc(x || d.answer)}</p></div></div>`;
+    }
+    const data = d.data || {};
+    if (m.kind === "agent" && !d.refused) {
+      if (d.tool === "lookup_transaction" && data.found) {
+        html += `<div class="answer">${textToHtml(d.answer.split(". Top reason")[0] + ".")}</div>`;
+        html += transactionCard({ row_id: data.row_id, transaction_type: data.transaction_type, amount: data.amount, score: data.model_score,
+          threshold: data.model_threshold, level: data.model_says, confirmed: data.confirmed_fraud, reasons: data.reasons, reason_method: data.reason_method });
+      } else if (d.tool === "score_new_transaction" && data.scored) {
+        html += `<div class="answer">${textToHtml(d.answer.split(" Top reason")[0])}</div>`;
+        html += transactionCard({ isNew: true, transaction_type: (d.arguments.transaction || {}).transaction_type, amount: (d.arguments.transaction || {}).amount,
+          score: data.model_score, threshold: data.model_threshold, level: data.model_says, reasons: data.reasons, reason_method: data.reason_method,
+          unspecified: data.unspecified_fields });
+      } else if (d.tool === "aggregate_stats" && data.ok) {
+        html += `<div class="answer">${textToHtml(d.answer)}</div>` + aggregateCard(data);
+      } else if (d.tool === "find_similar_cases" && data.neighbours && data.neighbours.length) {
+        html += similarCard(data);
+      } else {
+        html += `<div class="answer">${textToHtml(d.answer)}</div>`;
+      }
+      if (d.tool === "search_knowledge") html += sources(data.citations);
+    }
+    if (m.kind === "ask" && !d.refused) html += `<div class="answer">${textToHtml(d.answer)}</div>` + sources(d.citations);
+    if (m.kind === "agent" && d.refused && d.refusal_reason === "missing_arguments") html = `<div class="notice warn"><div><b>I need a little more detail</b><p>${esc(d.answer)}</p></div></div>`;
+
+    if (m.kind === "agent" && d.tool) meta.push(`<span class="chip">tool · <b>${esc(d.tool)}</b></span>`);
+    if (m.kind === "ask" && !d.refused) meta.push(d.answer_method && d.answer_method.startsWith("generated")
+      ? "" : `<span class="chip offline">${d.answer_method && d.answer_method.startsWith("extracted") ? "extractive answer · no LLM" : esc(d.answer_method || "")}</span>`);
+    if (d.groundedness != null) meta.push(`<span class="chip" title="Share of the answer's words found in the retrieved passages (week 9)">grounded ${Math.round(d.groundedness * 100)}%</span>`);
+    meta.push(llmChips(d.llm_calls));
+    if (m.kind === "agent" && d.route_method && !d.route_method.startsWith("llm") && d.route_method !== "not routed")
+      meta.push(`<span class="chip offline">routed by keyword rules</span>`);
+    meta.push(`<span class="chip">${Math.round(d.elapsed_ms)} ms</span>`);
+  }
+  const trace = m.kind === "agent" ? traceBlock(d.trace, d.route_method) : "";
+  return `${html}<div class="meta">${meta.filter(Boolean).join("")}</div>${trace}`;
+}
+
+const AVATAR = `<div class="avatar" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3z"/></svg></div>`;
+
+function render() {
+  const inner = $("threadInner");
+  if (!state.messages.length) {
+    $("title").textContent = "New conversation";
+    inner.innerHTML = `<div class="welcome"><h2>What would you like to look into?</h2>
+      <p>Ask about a transaction, the fraud model or the portfolio. Every answer comes with its evidence: the score and its reasons, the documents it cites, and the model that wrote it.</p>
+      <div class="starters">${starters().map((s) => `<button class="starter" type="button" data-ask="${esc(s.text)}"><b>${esc(s.title)}</b><span>${esc(s.text)}</span></button>`).join("")}</div></div>`;
+    return;
+  }
+  const first = state.messages.find((m) => m.role === "user");
+  $("title").textContent = first ? first.text : "Conversation";
+  inner.innerHTML = state.messages.map((m) => {
+    if (m.role === "user") return `<div class="msg-user">${m.mode !== "auto" ? `<span class="mode">${esc(MODES[m.mode].label)}</span>` : ""}${esc(m.text)}</div>`;
+    if (m.role === "pending") return `<div class="msg-bot">${AVATAR}<div class="bot-body"><div class="thinking"><span class="dots"><i></i><i></i><i></i></span><span id="pendingText">${esc(m.text)}</span></div></div></div>`;
+    return `<div class="msg-bot">${AVATAR}<div class="bot-body">${botBody(m)}</div></div>`;
+  }).join("");
+  $("thread").scrollTop = $("thread").scrollHeight;
+}
+
+// -------------------------------------------------------------------- sending
+async function send(text, mode = state.mode, opts = {}) {
+  text = text.trim();
+  if (!text || state.busy) return;
+  state.messages.push({ role: "user", text, mode });
+  const waiting = { auto: "Choosing a tool…", docs: "Searching the documents…", score: "Scoring…" }[mode];
+  state.messages.push({ role: "pending", text: waiting });
+  state.busy = true; syncSend(); render();
+  const started = performance.now();
+  const timer = setInterval(() => { const el = $("pendingText"); if (el) el.textContent = `${waiting} ${((performance.now() - started) / 1000).toFixed(1)} s`; }, 200);
+
+  let reply;
+  if (mode === "score") {
+    const id = (text.match(/\d+/) || [])[0];
+    if (!id) reply = { role: "bot", kind: "hint", title: "Which transaction?", text: "Score mode needs a transaction id, for example 451. To score a new transaction, switch to Auto and describe it." };
+    else {
+      const useLlm = opts.useLlm ?? $("useLlm").checked;
+      const r = await call(`/api/predict/${encodeURIComponent(id)}?use_llm=${useLlm}`);
+      reply = r.ok ? { role: "bot", kind: "predict", data: r.data } : { role: "bot", kind: "error", status: r.status, data: r.data, rid: r.rid };
+    }
+  } else {
+    const r = await call(mode === "docs" ? "/api/ask" : "/api/agent", { method: "POST", body: JSON.stringify({ question: text }) });
+    if (r.ok) reply = { role: "bot", kind: mode === "docs" ? "ask" : "agent", data: r.data };
+    else {
+      const detail = r.status === 422 ? { error: "validation_error", detail: "Questions need between 3 and 500 characters." } : r.data;
+      reply = { role: "bot", kind: "error", status: r.status, data: detail, rid: r.rid };
+    }
+  }
+  clearInterval(timer);
+  state.messages = state.messages.filter((m) => m.role !== "pending");
+  state.messages.push(reply);
+  state.busy = false; syncSend(); save(); render();
+}
+
+function syncSend() { $("send").disabled = state.busy || !$("input").value.trim(); }
+
+function setMode(mode) {
+  state.mode = mode;
+  document.querySelectorAll(".modes button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === mode)));
+  $("input").placeholder = MODES[mode].placeholder;
+  $("summaryToggle").hidden = mode !== "score";
+  $("input").focus();
+}
+
+// -------------------------------------------------------------------- events
+$("composer").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = $("input").value;
+  $("input").value = ""; autosize(); send(text);
+});
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("composer").requestSubmit(); }
+});
+function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; syncSend(); }
+$("input").addEventListener("input", autosize);
+document.querySelectorAll(".modes button").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
+
+document.addEventListener("click", (e) => {
+  const ask = e.target.closest("[data-ask]");
+  if (ask) { closeNav(); send(ask.dataset.ask, "auto"); return; }
+  const score = e.target.closest("[data-score]");
+  if (score) { send(`Score transaction ${score.dataset.score} with an AI summary`, "score", { useLlm: true }); return; }
+  const pill = $("modelPill");
+  if (pill.open && !pill.contains(e.target)) pill.open = false;
+});
+$("newChat").addEventListener("click", () => { state.messages = []; save(); render(); closeNav(); $("input").focus(); });
+$("menu").addEventListener("click", () => $("app").classList.add("nav-open"));
+$("scrim").addEventListener("click", closeNav);
+function closeNav() { $("app").classList.remove("nav-open"); }
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeNav(); $("modelPill").open = false; } });
+
+// -------------------------------------------------------------------- start
+state.messages = load().filter((m) => m.role !== "pending");
+renderPrompts(); render(); refreshStatus(); loadSamples();
+</script>
+</body>
+</html>

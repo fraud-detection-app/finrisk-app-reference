@@ -1,0 +1,4 @@
+# Your laptop / CI list: the service's libraries plus what the tests need.
+-r requirements-service.txt
+pytest>=8.0.0
+pyyaml>=6.0

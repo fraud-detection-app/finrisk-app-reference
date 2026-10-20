@@ -1,0 +1,103 @@
+# CI = continuous integration: every change is tested BEFORE it is merged.
+#
+# Runs on every pull request, and again after a merge into main. The ruleset on main (set by
+# finrisk-infra/scripts/github_bootstrap.sh) refuses to merge a pull request until these two jobs are green.
+# The names GitHub shows -- and the ruleset requires -- are exactly the job names below:
+#
+#   test        the Python tests (pytest)
+#   terraform   the service stack in deploy/terraform: format, validate and the offline `terraform test`s
+#
+# Nothing here touches AWS: no credentials, no cost. The pipeline that deploys is deliver.yml.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read # the least a job needs: read the code. Nothing here writes to the repository.
+
+# A newer push to the same pull request makes the older run pointless, so cancel it.
+# (Never cancel runs on main: each one is a record of a merge.)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+# Every job runs on ubuntu-24.04, the image this pipeline was rehearsed on. `ubuntu-latest` moves to Ubuntu 26 on
+# 19 Oct 2026; pin the runner like you pin actions, and move to a new image on purpose, in a pull request.
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      LLM_PROVIDER: none # the tests never call a model
+      DEEPSEEK_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12" # the same Python as the Dockerfile, so CI tests what ships
+          cache: pip
+
+      - name: Install the project
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # The baked fallback (a demo model, its features and a small index) is NOT in git: the release image makes it
+      # while it builds. The API tests need the same files, so make them the same way, on 5,000 synthetic rows.
+      - name: Make the demo model and index
+        run: DATA_MODE=demo python scripts/run_pipeline.py --demo-rows 5000
+
+      # The Terraform tests skip themselves here (Terraform is not installed in this job); the `terraform` job covers them.
+      - name: Run the tests
+        run: python -m pytest -q
+
+  terraform:
+    name: terraform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false # the wrapper would add its own lines to `terraform output`
+
+      - name: Format (terraform fmt)
+        run: terraform fmt -check -recursive -diff deploy
+
+      # `-backend=false`: validate the code without connecting to the S3 state bucket (and without credentials).
+      - name: Validate
+        run: |
+          terraform -chdir=deploy/terraform init -backend=false -input=false
+          terraform -chdir=deploy/terraform validate
+
+      # The stack insists that the Terraform workspace is named like the environment, and `terraform test` runs in
+      # whatever workspace is selected. So: a scratch copy with local state (no S3), one workspace per test file.
+      # The tests use a fake ("mock") AWS provider and fake SSM values: nothing is read or created.
+      - name: Test the stack (offline)
+        run: |
+          cp -R deploy/terraform "$RUNNER_TEMP/svc-test"
+          cd "$RUNNER_TEMP/svc-test"
+          rm -rf backend.tf .terraform
+          terraform init -input=false
+          for file in tests/*.tftest.hcl; do
+            name="$(basename "$file" .tftest.hcl)"
+            case "$name" in
+              sit|pre-prod|prod) workspace="$name" ;;
+              *) workspace=dev ;; # dev.tftest.hcl, rejects.tftest.hcl and any other file run as dev
+            esac
+            echo "::group::terraform test $file (workspace $workspace)"
+            terraform workspace select -or-create "$workspace"
+            terraform test -filter="$file"
+            echo "::endgroup::"
+          done

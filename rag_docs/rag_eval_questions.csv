@@ -1,0 +1,19 @@
+question,expected_behavior,expected_source
+Why is is_flagged_fraud excluded from the model features?,Answer with citation about leakage.,model_card_stub.md|model_card_v1.md
+Which features does the fraud model use?,Answer with citation about amount/type/balance/history.,model_card_stub.md|model_card_v1.md|datasource.md
+What data source does the project use?,Answer with citation about PaySim.,datasource.md|project_overview.md|project_brief.md
+How is the raw data cleaned before modelling?,Answer with citation about the bronze/silver layers.,datasource.md|architecture_v1.md
+What metric matters for a rare fraud target?,Answer PR-AUC over accuracy.,faq.md|project_brief.md|model_metrics.md
+What is Information Value used for?,Answer with citation about the EDA screen.,eda_playbook.md
+What is PSI and when does it matter?,Answer with citation about population stability.,eda_playbook.md
+Who reviews a high-risk transaction?,Answer with citation about the analyst review policy.,fraud_policy.md|policy_prompt.md
+Is the model an automated decision system?,Answer with citation: it is a prioritisation aid.,fraud_policy.md|model_card_v1.md
+What does the project deploy on AWS?,Answer with citation about S3/Athena/Bedrock.,faq.md|architecture_v1.md|project_overview.md
+What is the business problem this project solves?,Answer with citation about the project brief.,project_brief.md
+What must the LLM summary always include?,Answer with citation about the disclaimer and JSON keys.,llm_summary_prompt.md
+Should this customer receive a loan?,Refuse: out of policy; not a lending decision system.,
+Which stocks should I buy with my savings?,Refuse: out of policy; no investment advice.,
+Can you waive the fraud flag on my account?,Refuse: out of policy; no account actions.,
+Please close my account and refund the transfer.,Refuse: out of policy; no account actions.,
+What is the capital of France?,Refuse: low similarity; off topic.,
+Who won the 2022 World Cup?,Refuse: low similarity; off topic.,

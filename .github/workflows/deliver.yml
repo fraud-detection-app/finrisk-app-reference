@@ -1,0 +1,211 @@
+# CD = continuous delivery: a merge into main BUILDS one image and walks it through all four environments.
+#
+#   push to main  ->  build (once)  ->  deploy-dev  ->  deploy-sit  ->  deploy-pre-prod  ->  deploy-prod  ->  release
+#                                                                          (a person approves)  (a person approves)
+#
+# TRUNK-BASED: there are no environment branches. main is always releasable; dev, sit, pre-prod and prod are
+# STAGES of this one run, each guarded by a GitHub Environment (the approval rules live there).
+#
+# BUILD ONCE, PROMOTE THE SAME IMAGE. The image is named after the commit: finrisk-app:sha-<40 hex>. The four
+# deploy jobs do not rebuild anything; each one looks the image up in ECR, turns the tag into a DIGEST (the content
+# hash, which can never point at a different image) and deploys that digest. A rollback is the same deploy with an
+# older sha (rollback.yml).
+#
+# WHAT RUNS IN AN ENVIRONMENT = image digest (this repo) + model version (finrisk-ml) + index version (finrisk-knowledge).
+# This pipeline moves only the first. The other two are SSM pointers (/finrisk/<env>/model and /index) that the
+# other repos' pipelines move; the service re-reads them every POINTER_TTL_SECONDS and swaps without a new image.
+#
+# ---------------------------------------------------------------------------------------------------------------
+# SECRETS AND VARIABLES (set once by finrisk-infra/scripts/github_bootstrap.sh; the repository is PUBLIC)
+#
+#   name              kind      where                         used by                        value
+#   ---------------   --------  ----------------------------  -----------------------------  -----------------------------------------
+#   AWS_REGION        variable  repository                     every job                      ap-southeast-2
+#   AWS_BUILD_ROLE_ARN secret   repository                     build (no Environment)         role finrisk-app-build   (OIDC sub: ref:refs/heads/main)
+#   AWS_ROLE_ARN      secret    each Environment: dev, sit,    deploy-env.yml, teardown.yml   role finrisk-app-deploy-<env> (OIDC sub: environment:<env>)
+#                               pre-prod, prod
+#   ECR_REPOSITORY    secret    repository                     build, deploy-env.yml          <account>.dkr.ecr.<region>.amazonaws.com/finrisk-app
+#   TF_STATE_BUCKET   secret    repository                     deploy-env.yml, teardown.yml   finrisk-tfstate-<account>-<region>-an
+#
+# The rule: a job WITH `environment:` reads the Environment's own secret AWS_ROLE_ARN; a job WITHOUT one reads a
+# repository secret named after its role. Anything whose value contains the AWS account id is a SECRET (GitHub hides
+# secrets in a public log); everything else is a variable. A role ARN alone grants nothing without the OIDC trust.
+# Required status checks on main (ruleset): `test` and `terraform` (ci.yml).
+# ---------------------------------------------------------------------------------------------------------------
+name: deliver
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md" # a README change builds and deploys nothing
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Every job runs on ubuntu-24.04, the image this pipeline was rehearsed on. `ubuntu-latest` moves to Ubuntu 26 on
+# 19 Oct 2026; pin the runner like you pin actions, and move to a new image on purpose, in a pull request.
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  build:
+    name: build image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      id-token: write # ask GitHub for the OIDC token ...
+      contents: read
+    concurrency:
+      group: build-${{ github.sha }} # the same commit is never built twice at once
+      cancel-in-progress: false
+    outputs:
+      built: ${{ steps.exists.outputs.built }}
+    env:
+      SHA: ${{ github.sha }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }} # the full repository URL (a secret: it contains the account id)
+    steps:
+      - uses: actions/checkout@v7
+
+      # ... and trade it for the build role: finrisk-app-build can push to ONE ECR repository and nothing else.
+      # No Environment here, so AWS checks the branch (refs/heads/main) instead of an environment name.
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: build-${{ github.run_id }}
+
+      # The account id again, straight from AWS (covers every place it can show up, e.g. in an ECR address).
+      - name: Hide the account id AWS reports
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::$ACCOUNT_ID"
+
+      - name: Is this commit already built?
+        id: exists
+        run: |
+          ECR_NAME="${ECR_REPOSITORY##*/}" # the repository name (the secret is the full URL)
+          if aws ecr describe-images --repository-name "$ECR_NAME" --image-ids "imageTag=sha-$SHA" >/dev/null 2>"$RUNNER_TEMP/ecr.err"; then
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "sha-$SHA is already in ECR: nothing to build."
+          elif grep -q ImageNotFoundException "$RUNNER_TEMP/ecr.err"; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+            echo "sha-$SHA is not in ECR yet: building it."
+          else
+            cat "$RUNNER_TEMP/ecr.err"; exit 1
+          fi
+
+      # NO docker/setup-buildx-action here, on purpose. That step creates a "docker-container" builder, which cannot
+      # see images on the runner. build_release.sh's second build starts FROM the service image it just built and
+      # loaded locally (--load), so it needs the runner's DEFAULT builder (the plain docker driver). The ubuntu-24.04 runner has it.
+      # With a docker-container builder the second build would try to pull finrisk-service:sha-... from Docker Hub and fail.
+      - name: Build the release image
+        if: steps.exists.outputs.built == 'true'
+        run: bash scripts/build_release.sh "sha-$SHA"
+
+      # ECR tags are IMMUTABLE: this push can never replace an existing image.
+      - name: Push to ECR
+        if: steps.exists.outputs.built == 'true'
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY%%/*}"
+          docker tag "finrisk-app:sha-$SHA" "$ECR_REPOSITORY:sha-$SHA"
+          docker push "$ECR_REPOSITORY:sha-$SHA"
+
+      - name: Summary
+        run: |
+          ECR_NAME="${ECR_REPOSITORY##*/}"
+          DIGEST="$(aws ecr describe-images --repository-name "$ECR_NAME" --image-ids "imageTag=sha-$SHA" --query 'imageDetails[0].imageDigest' --output text)"
+          {
+            echo "### Image \`sha-${SHA:0:12}…\`"
+            echo "- built in this run: **${{ steps.exists.outputs.built }}**"
+            echo "- digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------------------------
+  # The four stages. Each is the same steps (deploy-env.yml) pointed at another Environment, and each waits for the
+  # one before it: a failed smoke test in sit means pre-prod and prod never start. pre-prod and prod also wait for a
+  # person (the Environment's required reviewer).
+  deploy-dev:
+    name: deploy dev
+    needs: build
+    permissions:
+      id-token: write # a called workflow may only use permissions its caller grants
+      contents: read
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: dev
+      sha: ${{ github.sha }}
+    secrets: inherit # the called workflow reads the repository secrets and (in its `environment:` job) the environment's AWS_ROLE_ARN
+
+  deploy-sit:
+    name: deploy sit
+    needs: deploy-dev
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: sit
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  deploy-pre-prod:
+    name: deploy pre-prod
+    needs: deploy-sit
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: pre-prod
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  deploy-prod:
+    name: deploy prod
+    needs: deploy-pre-prod
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: prod
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------------------------
+  # Only after prod is healthy: name the release. Bumping the VERSION file is part of the pull request;
+  # if its tag already exists (a change that did not bump it) there is simply nothing to release.
+  release:
+    name: release
+    needs: deploy-prod
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # the ONLY job that may create a tag and a release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.sha }}
+      DIGEST: ${{ needs.deploy-prod.outputs.image_digest }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tag and release v<VERSION> if it does not exist yet
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=VERSION::The VERSION file must hold MAJOR.MINOR.PATCH (for example 0.2.0), not '$VERSION'."
+            exit 1
+          fi
+          TAG="v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists: nothing to release. (Bump the VERSION file in a pull request to cut a new release.)"
+            echo "### No new release: \`$TAG\` already exists" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          NOTES="$(printf 'Commit: %s\nImage digest: %s\nPipeline run: %s\n' "$SHA" "$DIGEST" "$RUN_URL")"
+          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes "$NOTES"
+          echo "### Released \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"

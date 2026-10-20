@@ -1,0 +1,39 @@
+# Everything here is left OUT of the build context -- Docker never even sees it.
+# A smaller context means faster builds, smaller images, and no accidental secrets.
+
+# Secrets -- the lines that matter most. A key baked into an image is a leaked key with a version
+# tag: anyone who can pull the image can read it.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local environments and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Version control and CI
+.git/
+.github/
+
+# Data and artifacts: the baked fallback is made INSIDE the release build (Dockerfile.aws); the real
+# model and index come from S3 through the SSM pointers. Never copied from a laptop.
+data/
+models/
+vector_index*/
+reports/
+build/
+experiment_log.csv
+
+# Not needed to SERVE requests
+tests/
+deploy/
+scripts/*.sh
+*.ipynb
+/*.md

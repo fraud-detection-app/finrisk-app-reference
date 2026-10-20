@@ -1,0 +1,23 @@
+{
+  "app_env": "pre-prod",
+  "data_mode": "prod-like",
+  "log_level": "INFO",
+  "aws_region": "ap-southeast-2",
+  "aws_s3_bucket": "replace-with-your-preprod-bucket-name",
+  "aws_s3_prefix": "pre-prod",
+  "athena_database": "financial_risk_assistant_preprod",
+  "athena_workgroup": "primary",
+  "allow_cloud_deploy": true,
+  "require_manual_approval": true,
+  "bedrock_model_id": "deepseek.v3.2",
+  "bedrock_max_tokens": 600,
+  "bedrock_temperature": 0.2,
+  "raw_data_path": "data/raw/paysim.csv",
+  "bronze_path": "data/bronze/transactions.parquet",
+  "silver_path": "data/silver/clean_transactions.parquet",
+  "gold_path": "data/gold",
+  "model_dir": "models",
+  "report_dir": "reports",
+  "vector_index_dir": "vector_index",
+  "rag_docs_dir": "rag_docs"
+}
